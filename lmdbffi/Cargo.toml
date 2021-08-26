@@ -1,0 +1,12 @@
+[package]
+name = "lmdbffi"
+version = "0.1.0"
+edition = "2018"
+authors = ["Datong Sun <dndx@idndx.com>"]
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+lmdb-rkv = "0.14.0"
+
+[lib]
+crate-type = ["staticlib", "cdylib"]
