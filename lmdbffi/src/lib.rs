@@ -1,7 +1,9 @@
 use core::slice::{from_raw_parts, from_raw_parts_mut};
 use lmdb::{
-    self, Database, DatabaseFlags, Environment, InactiveTransaction, Transaction, WriteFlags,
+    self, Cursor, Database, DatabaseFlags, Environment, InactiveTransaction, Transaction,
+    WriteFlags,
 };
+use std::collections::HashMap;
 use std::error::Error;
 use std::ffi::CStr;
 use std::io::{ErrorKind, Write};
@@ -33,6 +35,7 @@ pub struct LMDBHandle<'env> {
     inactive_txn: Option<InactiveTransaction<'env>>,
     last_err: Option<lmdb::Error>,
     default_db: Database,
+    databases: HashMap<String, Database>,
 }
 
 #[no_mangle]
@@ -57,12 +60,13 @@ pub extern "C" fn ngx_lmdb_handle_open<'env>(
 
     match Environment::new().open_with_permissions(Path::new(path), perm) {
         Ok(env) => {
-            let default_db = env.create_db(None, DatabaseFlags::empty()).unwrap();
+            let default_db = env.open_db(None).unwrap();
             Box::into_raw(Box::new(LMDBHandle {
                 env,
                 last_err: None,
                 inactive_txn: None,
                 default_db,
+                databases: HashMap::new(),
             }))
         }
         Err(e) => {
@@ -168,4 +172,98 @@ pub extern "C" fn ngx_lmdb_handle_set_multi(
 
     try_lmdb!(handle, txn.commit());
     ReturnCode::OK
+}
+
+#[no_mangle]
+pub extern "C" fn ngx_lmdb_handle_clear_database(
+    handle: &mut LMDBHandle,
+    name: *const c_char,
+) -> ReturnCode {
+    let name = unsafe { CStr::from_ptr(name).to_str().unwrap() };
+    let dbi = try_lmdb!(handle, get_database_handle(handle, name, false));
+    let mut txn = try_lmdb!(handle, handle.env.begin_rw_txn());
+
+    try_lmdb!(handle, txn.clear_db(dbi));
+    try_lmdb!(handle, txn.commit());
+    ReturnCode::OK
+}
+
+#[no_mangle]
+pub extern "C" fn ngx_lmdb_handle_create_database(
+    handle: &mut LMDBHandle,
+    name: *const c_char,
+) -> ReturnCode {
+    let name = unsafe { CStr::from_ptr(name).to_str().unwrap() };
+    try_lmdb!(handle, get_database_handle(handle, name, true));
+
+    ReturnCode::OK
+}
+
+#[no_mangle]
+pub extern "C" fn ngx_lmdb_handle_drop_database(
+    handle: &mut LMDBHandle,
+    name: *const c_char,
+) -> ReturnCode {
+    let name = unsafe { CStr::from_ptr(name).to_str().unwrap() };
+    let dbi = try_lmdb!(handle, get_database_handle(handle, name, false));
+    let mut txn = try_lmdb!(handle, handle.env.begin_rw_txn());
+
+    try_lmdb!(handle, unsafe { txn.drop_db(dbi) });
+    try_lmdb!(handle, txn.commit());
+
+    handle.databases.remove(name);
+    ReturnCode::OK
+}
+
+#[no_mangle]
+pub extern "C" fn ngx_lmdb_handle_get_databases<'env>(
+    handle: &'env mut LMDBHandle<'env>,
+    num_keys: usize,
+    values_buf: *mut u8,
+    values_buf_len: usize,
+    value_lens: *mut i32,
+) -> ReturnCode {
+    let value_lens = unsafe { from_raw_parts_mut(value_lens, num_keys) };
+    let mut values_buf = unsafe { from_raw_parts_mut(values_buf, values_buf_len as usize) };
+    let txn = match handle.inactive_txn.take() {
+        None => try_lmdb!(handle, handle.env.begin_ro_txn()),
+        Some(t) => try_lmdb!(handle, t.renew()),
+    };
+
+    let mut cursor = try_lmdb!(handle, txn.open_ro_cursor(handle.default_db));
+    for (i, v) in cursor.iter().enumerate() {
+        let (key, val) = try_lmdb!(handle, v);
+        value_lens[i] = key.len() as i32;
+        if let Err(e) = values_buf.write_all(key) {
+            if e.kind() == ErrorKind::WriteZero {
+                return ReturnCode::AGAIN;
+            }
+
+            return ReturnCode::ERR;
+        }
+    }
+
+    drop(cursor);
+
+    handle.inactive_txn = Some(txn.reset());
+    ReturnCode::OK
+}
+
+fn get_database_handle(
+    handle: &mut LMDBHandle,
+    name: &str,
+    create: bool,
+) -> lmdb::Result<Database> {
+    match handle.databases.get(name) {
+        Some(dbi) => Ok(*dbi),
+        None => {
+            let dbi = if create {
+                handle.env.create_db(Some(name), DatabaseFlags::empty())?
+            } else {
+                handle.env.open_db(Some(name))?
+            };
+            handle.databases.insert(name.to_string(), dbi);
+            Ok(dbi)
+        }
+    }
 }
