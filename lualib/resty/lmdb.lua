@@ -5,7 +5,7 @@ local ffi = require("ffi")
 local base = require("resty.core.base")
 local table_new = require("table.new")
 
-local lib = ffi.load("/home/datong.sun/code/dndx/lua-resty-lmdb/lmdbffi/target/debug/liblmdbffi.so")
+local lib = ffi.load("/home/datong.sun/code/dndx/lua-resty-lmdb/lmdbffi/target/release/liblmdbffi.so")
 
 ffi.cdef([[
 typedef enum ReturnCode {
@@ -55,6 +55,7 @@ local VALUE_LENS = ffi.new("int32_t [?]", PTR_N)
 local VALUES_BUF = ffi.new("char [?]", VALUES_BUF_SIZE)
 local CACHED_KEYS = {}
 local CACHED_VALUES = {}
+local null = ngx.null
 
 
 local function get_key_ptrs(n)
@@ -193,7 +194,7 @@ end
 
 function _M:set(key, value)
     CACHED_KEYS[1] = key
-    CACHED_VALUES[1] = value
+    CACHED_VALUES[1] = value or null
 
     return self:set_multi(CACHED_KEYS, 1, CACHED_VALUES)
 end
@@ -219,8 +220,14 @@ function _M:set_multi(keys, nkeys, values)
         key_lens[i - 1] = #key
 
         local value = values[i]
-        value_ptrs[i - 1] = value
-        value_lens[i - 1] = #value
+        if value ~= null then
+            value_ptrs[i - 1] = value
+            value_lens[i - 1] = #value
+
+        else
+            value_ptrs[i - 1] = nil
+            value_lens[i - 1] = 0
+        end
     end
 
     local res = lib.ngx_lmdb_handle_set_multi(self.handle, nkeys, key_ptrs, key_lens, value_ptrs, value_lens)
