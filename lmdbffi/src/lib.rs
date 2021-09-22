@@ -1,7 +1,8 @@
+use bitflags::bitflags;
 use core::slice::{from_raw_parts, from_raw_parts_mut};
 use lmdb::{
-    self, Cursor, Database, DatabaseFlags, Environment, InactiveTransaction, Transaction,
-    WriteFlags,
+    self, Cursor, Database, DatabaseFlags, Environment, InactiveTransaction, RwTransaction,
+    Transaction, WriteFlags,
 };
 use std::collections::HashMap;
 use std::error::Error;
@@ -16,6 +17,38 @@ pub enum ReturnCode {
     OK,
     ERR,
     AGAIN,
+}
+
+bitflags! {
+    #[repr(C)]
+    pub struct LMDBResultFlags: u8 {
+        const NOT_FOUND = 0b00000001;
+        const AGAIN = 0b00000010;
+    }
+}
+
+#[repr(C)]
+pub struct LMDBOperationArgs {
+    key: *const u8,
+    key_len: usize,
+    value: *mut u8,
+    value_len: usize,
+    flags: LMDBResultFlags,
+}
+
+#[repr(C)]
+pub enum LMDBOperationCode {
+    Get,
+    Set,
+    CreateDB,
+    DropDB,
+    ClearDB,
+}
+
+#[repr(C)]
+pub struct LMDBOperation {
+    op_code: LMDBOperationCode,
+    args: LMDBOperationArgs,
 }
 
 macro_rules! try_lmdb {
@@ -83,135 +116,117 @@ pub extern "C" fn ngx_lmdb_handle_close(handle: *mut LMDBHandle) {
     unsafe { Box::from_raw(handle) };
 }
 
-#[no_mangle]
-pub extern "C" fn ngx_lmdb_handle_get_multi<'env>(
-    handle: &'env mut LMDBHandle<'env>,
-    num_keys: usize,
-    key_ptrs: *const *const u8,
-    key_lens: *mut u32,
-    values_buf: *mut u8,
-    values_buf_len: usize,
-    value_lens: *mut i32,
-) -> ReturnCode {
-    let key_lens = unsafe { from_raw_parts(key_lens, *key_lens as usize) };
-    let value_lens = unsafe { from_raw_parts_mut(value_lens, num_keys) };
-    let key_ptrs = unsafe { from_raw_parts(key_ptrs, num_keys as usize) };
-    let mut values_buf = unsafe { from_raw_parts_mut(values_buf, values_buf_len as usize) };
-    let txn = match handle.inactive_txn.take() {
-        None => try_lmdb!(handle, handle.env.begin_ro_txn()),
-        Some(t) => try_lmdb!(handle, t.renew()),
+fn execute_lmdb_get<T: Transaction>(
+    dbi: Database,
+    txn: &T,
+    opt: &mut LMDBOperationArgs,
+) -> lmdb::Result<()> {
+    let key = unsafe { from_raw_parts(opt.key, opt.key_len) };
+    let mut value = unsafe { from_raw_parts_mut(opt.value, opt.value_len) };
+
+    match txn.get(dbi, &key) {
+        Ok(val) => {
+            opt.value_len = val.len();
+            if let Err(e) = value.write_all(val) {
+                if e.kind() == ErrorKind::WriteZero {
+                    opt.flags.insert(LMDBResultFlags::AGAIN);
+                } else {
+                    // memory writes should never fail for other reasons
+                    unreachable!();
+                }
+            }
+        }
+        Err(lmdb::Error::NotFound) => {
+            opt.flags.insert(LMDBResultFlags::NOT_FOUND);
+        }
+        Err(e) => return Err(e),
     };
 
-    for i in 0..num_keys {
-        let k = unsafe { from_raw_parts(key_ptrs[i], key_lens[i] as usize) };
-        match txn.get(handle.default_db, &k) {
-            Ok(val) => {
-                value_lens[i] = val.len() as i32;
-                if let Err(e) = values_buf.write_all(val) {
-                    if e.kind() == ErrorKind::WriteZero {
-                        return ReturnCode::AGAIN;
-                    }
+    Ok(())
+}
 
-                    return ReturnCode::ERR;
+fn execute_lmdb_set(
+    dbi: Database,
+    txn: &mut RwTransaction,
+    opt: &mut LMDBOperationArgs,
+) -> lmdb::Result<()> {
+    let key = unsafe { from_raw_parts(opt.key, opt.key_len) };
+    let value = unsafe { from_raw_parts(opt.value, opt.value_len) };
+
+    if opt.value.is_null() {
+        // delete
+
+        match txn.del(dbi, &key, None) {
+            Ok(_) | Err(lmdb::Error::NotFound) => Ok(()),
+            Err(e) => Err(e),
+        }
+    } else {
+        match txn.put(dbi, &key, &value, WriteFlags::empty()) {
+            Ok(_) | Err(lmdb::Error::NotFound) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+fn execute_lmdb_cleardb(dbi: Database, txn: &mut RwTransaction) -> lmdb::Result<()> {
+    txn.clear_db(dbi)
+}
+
+#[no_mangle]
+pub extern "C" fn ngx_lmdb_handle_execute(
+    handle: &mut LMDBHandle,
+    ops: *mut LMDBOperation,
+    n: usize,
+    write: bool,
+) -> ReturnCode {
+    let ops = unsafe { from_raw_parts_mut(ops, n) };
+    if write {
+        let mut txn = try_lmdb!(handle, handle.env.begin_rw_txn());
+
+        for op in ops {
+            op.args.flags = LMDBResultFlags::empty();
+
+            match op.op_code {
+                LMDBOperationCode::Get => {
+                    try_lmdb!(
+                        handle,
+                        execute_lmdb_get(handle.default_db, &txn, &mut op.args)
+                    );
                 }
-            }
-            Err(lmdb::Error::NotFound) => {
-                value_lens[i] = -1;
-            }
-            Err(e) => {
-                handle.last_err = Some(e);
-                return ReturnCode::ERR;
-            }
+                LMDBOperationCode::Set => {
+                    try_lmdb!(
+                        handle,
+                        execute_lmdb_set(handle.default_db, &mut txn, &mut op.args)
+                    );
+                    assert!(op.args.flags.is_empty());
+                }
+                LMDBOperationCode::ClearDB => {
+                    try_lmdb!(handle, execute_lmdb_cleardb(handle.default_db, &mut txn));
+                    assert!(op.args.flags.is_empty());
+                }
+                _ => (),
+            };
+        }
+        try_lmdb!(handle, txn.commit());
+    } else {
+        let txn = match handle.inactive_txn.take() {
+            None => try_lmdb!(handle, handle.env.begin_ro_txn()),
+            Some(t) => try_lmdb!(handle, t.renew()),
+        };
+
+        for op in ops {
+            match op.op_code {
+                LMDBOperationCode::Get => {
+                    try_lmdb!(
+                        handle,
+                        execute_lmdb_get(handle.default_db, &txn, &mut op.args)
+                    );
+                }
+                _ => (),
+            };
         }
     }
 
-    handle.inactive_txn = Some(txn.reset());
-
-    ReturnCode::OK
-}
-
-#[no_mangle]
-pub extern "C" fn ngx_lmdb_handle_set_multi(
-    handle: &mut LMDBHandle,
-    num_keys: usize,
-    key_ptrs: *const *const u8,
-    key_lens: *mut u32,
-    value_ptrs: *const *const u8,
-    value_lens: *mut u32,
-) -> ReturnCode {
-    let key_ptrs = unsafe { from_raw_parts(key_ptrs, num_keys) };
-    let key_lens = unsafe { from_raw_parts(key_lens, num_keys) };
-    let value_ptrs = unsafe { from_raw_parts(value_ptrs, num_keys) };
-    let value_lens = unsafe { from_raw_parts(value_lens, num_keys) };
-    let mut txn = try_lmdb!(handle, handle.env.begin_rw_txn());
-
-    for i in 0..num_keys {
-        let key = unsafe { from_raw_parts(key_ptrs[i], key_lens[i] as usize) };
-        let value = unsafe { from_raw_parts(value_ptrs[i], value_lens[i] as usize) };
-
-        if value_ptrs[i].is_null() {
-            // delete
-
-            match txn.del(handle.default_db, &key, None) {
-                Ok(_) | Err(lmdb::Error::NotFound) => {}
-                Err(e) => {
-                    handle.last_err = Some(e);
-                    return ReturnCode::ERR;
-                }
-            }
-        } else {
-            match txn.put(handle.default_db, &key, &value, WriteFlags::empty()) {
-                Ok(_) | Err(lmdb::Error::NotFound) => {}
-                Err(e) => {
-                    handle.last_err = Some(e);
-                    return ReturnCode::ERR;
-                }
-            }
-        }
-    }
-
-    try_lmdb!(handle, txn.commit());
-    ReturnCode::OK
-}
-
-#[no_mangle]
-pub extern "C" fn ngx_lmdb_handle_clear_database(
-    handle: &mut LMDBHandle,
-    name: *const c_char,
-) -> ReturnCode {
-    let name = unsafe { CStr::from_ptr(name).to_str().unwrap() };
-    let dbi = try_lmdb!(handle, get_database_handle(handle, name, false));
-    let mut txn = try_lmdb!(handle, handle.env.begin_rw_txn());
-
-    try_lmdb!(handle, txn.clear_db(dbi));
-    try_lmdb!(handle, txn.commit());
-    ReturnCode::OK
-}
-
-#[no_mangle]
-pub extern "C" fn ngx_lmdb_handle_create_database(
-    handle: &mut LMDBHandle,
-    name: *const c_char,
-) -> ReturnCode {
-    let name = unsafe { CStr::from_ptr(name).to_str().unwrap() };
-    try_lmdb!(handle, get_database_handle(handle, name, true));
-
-    ReturnCode::OK
-}
-
-#[no_mangle]
-pub extern "C" fn ngx_lmdb_handle_drop_database(
-    handle: &mut LMDBHandle,
-    name: *const c_char,
-) -> ReturnCode {
-    let name = unsafe { CStr::from_ptr(name).to_str().unwrap() };
-    let dbi = try_lmdb!(handle, get_database_handle(handle, name, false));
-    let mut txn = try_lmdb!(handle, handle.env.begin_rw_txn());
-
-    try_lmdb!(handle, unsafe { txn.drop_db(dbi) });
-    try_lmdb!(handle, txn.commit());
-
-    handle.databases.remove(name);
     ReturnCode::OK
 }
 
@@ -232,7 +247,7 @@ pub extern "C" fn ngx_lmdb_handle_get_databases<'env>(
 
     let mut cursor = try_lmdb!(handle, txn.open_ro_cursor(handle.default_db));
     for (i, v) in cursor.iter().enumerate() {
-        let (key, val) = try_lmdb!(handle, v);
+        let (key, _val) = try_lmdb!(handle, v);
         value_lens[i] = key.len() as i32;
         if let Err(e) = values_buf.write_all(key) {
             if e.kind() == ErrorKind::WriteZero {

@@ -67,3 +67,30 @@ nil
 [error]
 [warn]
 [crit]
+
+
+
+=== TEST 3: clear_db()
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            ngx.say(l:set("test", "value"))
+
+            local txn = l:begin(1)
+            txn:clear_db()
+            ngx.say(txn:commit())
+
+            ngx.say(l:get("test"))
+        }
+    }
+--- request
+GET /t
+--- response_body
+true
+true
+nil
+--- no_error_log
+[error]
+[warn]
+[crit]
